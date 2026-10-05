@@ -1,55 +1,82 @@
+import os
 import re
 import json
-import sqlite3
-import asyncio
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
 # =========================================================
-# SOZLAMALAR
+# SETTINGS
 # =========================================================
-
-import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-DB_FILE = "finance.db"
+PORT = int(os.getenv("PORT", "10000"))
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+# Telegram webhook path
+WEBHOOK_PATH = "telegram-webhook"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL topilmadi")
+
+print("=" * 50)
+print("MyFinance AI")
+print("=" * 50)
+print("Groq:", "YOQILGAN" if GROQ_API_KEY else "O'CHIRILGAN")
+print("Model:", GROQ_MODEL)
+print("Database: Supabase PostgreSQL")
+print("Port:", PORT)
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        connect_timeout=10
+    )
 
 
 def init_db():
-    conn = get_db()
+    conn = db()
     cur = conn.cursor()
 
-    # Asosiy tranzaksiyalar
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS finance_periods (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            title TEXT DEFAULT 'Hisob',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            period_id INTEGER NOT NULL,
             kind TEXT NOT NULL,
-            amount REAL NOT NULL,
+            amount NUMERIC(18,2) NOT NULL,
             person TEXT,
             category TEXT,
             note TEXT,
@@ -57,513 +84,116 @@ def init_db():
         )
     """)
 
-    # Qarzlar
     cur.execute("""
         CREATE TABLE IF NOT EXISTS debts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            period_id INTEGER NOT NULL,
             person TEXT,
-            amount REAL NOT NULL
-        )
-    """)
-
-    # debt_type ustuni eski DBda bo'lmasa qo'shamiz
-    columns = cur.execute(
-        "PRAGMA table_info(debts)"
-    ).fetchall()
-
-    names = [x["name"] for x in columns]
-
-    if "debt_type" not in names:
-        cur.execute("""
-            ALTER TABLE debts
-            ADD COLUMN debt_type TEXT DEFAULT 'I_OWE'
-        """)
-
-    # Hisob davrlari
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS finance_periods (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            amount NUMERIC(18,2) NOT NULL,
+            debt_type TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Tranzaksiya -> hisob davri
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transaction_periods (
-            transaction_id INTEGER PRIMARY KEY,
-            period_id INTEGER NOT NULL
-        )
-    """)
-
-    # Eski tranzaksiyalari bor userlar
-    users = cur.execute("""
-        SELECT DISTINCT user_id
-        FROM transactions
-    """).fetchall()
-
-    for user in users:
-
-        user_id = user["user_id"]
-
-        # User uchun period bormi?
-        first_period = cur.execute("""
-            SELECT id
-            FROM finance_periods
-            WHERE user_id = ?
-            ORDER BY id ASC
-            LIMIT 1
-        """, (user_id,)).fetchone()
-
-        # Bo'lmasa eski ma'lumotlar uchun 1-period yaratamiz
-        if not first_period:
-
-            cur.execute("""
-                INSERT INTO finance_periods (user_id)
-                VALUES (?)
-            """, (user_id,))
-
-            first_period_id = cur.lastrowid
-
-        else:
-
-            first_period_id = first_period["id"]
-
-        # Periodga biriktirilmagan eski tranzaksiyalarni
-        # birinchi periodga biriktiramiz.
-        cur.execute("""
-            INSERT OR IGNORE INTO transaction_periods
-            (
-                transaction_id,
-                period_id
-            )
-            SELECT
-                t.id,
-                ?
-            FROM transactions t
-            LEFT JOIN transaction_periods tp
-                ON tp.transaction_id = t.id
-            WHERE t.user_id = ?
-            AND tp.transaction_id IS NULL
-        """, (
-            first_period_id,
-            user_id
-        ))
-
     conn.commit()
+    cur.close()
     conn.close()
 
+    print("Database tayyor")
 
-# =========================================================
-# HISOB DAVRI
-# =========================================================
 
 def get_current_period(user_id):
+    conn = db()
+    cur = conn.cursor()
 
-    conn = get_db()
-
-    row = conn.execute("""
+    cur.execute("""
         SELECT id
         FROM finance_periods
-        WHERE user_id = ?
+        WHERE user_id = %s
         ORDER BY id DESC
         LIMIT 1
-    """, (user_id,)).fetchone()
+    """, (user_id,))
 
-    if not row:
+    row = cur.fetchone()
 
-        cur = conn.execute("""
-            INSERT INTO finance_periods (user_id)
-            VALUES (?)
+    if row:
+        period_id = row["id"]
+    else:
+        cur.execute("""
+            INSERT INTO finance_periods (user_id, title)
+            VALUES (%s, 'Hisob #1')
+            RETURNING id
         """, (user_id,))
+        period_id = cur.fetchone()["id"]
 
-        period_id = cur.lastrowid
-
-        conn.commit()
-        conn.close()
-
-        return period_id
-
-    period_id = row["id"]
-
+    conn.commit()
+    cur.close()
     conn.close()
 
     return period_id
 
 
 def create_new_period(user_id):
-
-    conn = get_db()
-
+    conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO finance_periods (user_id)
-        VALUES (?)
+        SELECT COUNT(*) AS cnt
+        FROM finance_periods
+        WHERE user_id = %s
     """, (user_id,))
 
-    period_id = cur.lastrowid
+    number = int(cur.fetchone()["cnt"]) + 1
+
+    cur.execute("""
+        INSERT INTO finance_periods (user_id, title)
+        VALUES (%s, %s)
+        RETURNING id
+    """, (user_id, f"Hisob #{number}"))
+
+    period_id = cur.fetchone()["id"]
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return period_id
 
 
 # =========================================================
-# PUL FORMAT
+# MONEY
 # =========================================================
 
-def money(value):
+def parse_amount(text):
+    text = text.lower().replace(",", ".").replace(" ", "")
 
-    value = float(value)
+    # 1.2 mln
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(mln|million|млн)", text)
+    if m:
+        return float(m.group(1)) * 1_000_000
 
-    if value.is_integer():
-        return f"{int(value):,}".replace(",", " ")
+    # 800 ming
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(ming|тыс)", text)
+    if m:
+        return float(m.group(1)) * 1_000
 
-    return f"{value:,.2f}".replace(",", " ")
+    # 5m
+    m = re.search(r"(\d+(?:\.\d+)?)\s*m\b", text)
+    if m:
+        return float(m.group(1)) * 1_000_000
 
+    # oddiy raqam
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
 
-# =========================================================
-# TRANSACTION QO'SHISH
-# =========================================================
+    if numbers:
+        return float(numbers[-1])
 
-def add_transaction(
-    user_id,
-    kind,
-    amount,
-    category=None,
-    note=None,
-    person=None
-):
+    return None
 
-    period_id = get_current_period(user_id)
 
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO transactions
-        (
-            user_id,
-            kind,
-            amount,
-            person,
-            category,
-            note
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        kind,
-        amount,
-        person,
-        category,
-        note
-    ))
-
-    transaction_id = cur.lastrowid
-
-    cur.execute("""
-        INSERT INTO transaction_periods
-        (
-            transaction_id,
-            period_id
-        )
-        VALUES (?, ?)
-    """, (
-        transaction_id,
-        period_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return transaction_id
-
-
-# =========================================================
-# OXIRGI TRANZAKSIYANI O'CHIRISH
-# =========================================================
-
-def delete_last_transaction(user_id):
-
-    period_id = get_current_period(user_id)
-
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT t.*
-        FROM transactions t
-        INNER JOIN transaction_periods tp
-            ON tp.transaction_id = t.id
-        WHERE t.user_id = ?
-        AND tp.period_id = ?
-        ORDER BY t.id DESC
-        LIMIT 1
-    """, (
-        user_id,
-        period_id
-    )).fetchone()
-
-    if not row:
-
-        conn.close()
-
-        return None
-
-    conn.execute("""
-        DELETE FROM transactions
-        WHERE id = ?
-    """, (row["id"],))
-
-    conn.execute("""
-        DELETE FROM transaction_periods
-        WHERE transaction_id = ?
-    """, (row["id"],))
-
-    conn.commit()
-    conn.close()
-
-    return row
-
-
-# =========================================================
-# BALANS
-# =========================================================
-
-def get_balance(user_id):
-
-    period_id = get_current_period(user_id)
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT t.*
-        FROM transactions t
-        INNER JOIN transaction_periods tp
-            ON tp.transaction_id = t.id
-        WHERE t.user_id = ?
-        AND tp.period_id = ?
-    """, (
-        user_id,
-        period_id
-    )).fetchall()
-
-    conn.close()
-
-    balance = 0
-
-    for row in rows:
-
-        if row["kind"] == "INCOME":
-            balance += float(row["amount"])
-
-        elif row["kind"] == "EXPENSE":
-            balance -= float(row["amount"])
-
-        elif row["kind"] == "DEBT_IN":
-            balance += float(row["amount"])
-
-        elif row["kind"] == "DEBT_OUT":
-            balance -= float(row["amount"])
-
-    return balance
-
-
-# =========================================================
-# TRANZAKSIYALAR RO'YXATI
-# =========================================================
-
-def get_transactions(
-    user_id,
-    kind=None,
-    days=None
-):
-
-    period_id = get_current_period(user_id)
-
-    conn = get_db()
-
-    query = """
-        SELECT t.*
-        FROM transactions t
-        INNER JOIN transaction_periods tp
-            ON tp.transaction_id = t.id
-        WHERE t.user_id = ?
-        AND tp.period_id = ?
-    """
-
-    params = [
-        user_id,
-        period_id
-    ]
-
-    if kind:
-
-        query += """
-            AND t.kind = ?
-        """
-
-        params.append(kind)
-
-    if days:
-
-        query += """
-            AND datetime(t.created_at)
-            >= datetime('now', ?)
-        """
-
-        params.append(
-            f"-{days} days"
-        )
-
-    query += """
-        ORDER BY t.id DESC
-    """
-
-    rows = conn.execute(
-        query,
-        params
-    ).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-# =========================================================
-# HISOBOT
-# =========================================================
-
-def get_report(user_id, days=None):
-
-    period_id = get_current_period(user_id)
-
-    conn = get_db()
-
-    query_base = """
-        FROM transactions t
-        INNER JOIN transaction_periods tp
-            ON tp.transaction_id = t.id
-        WHERE t.user_id = ?
-        AND tp.period_id = ?
-    """
-
-    params_base = [
-        user_id,
-        period_id
-    ]
-
-    if days:
-
-        query_base += """
-            AND datetime(t.created_at)
-            >= datetime('now', ?)
-        """
-
-        params_base.append(
-            f"-{days} days"
-        )
-
-    income = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(t.amount), 0)
-        {query_base}
-        AND t.kind = 'INCOME'
-        """,
-        params_base
-    ).fetchone()[0]
-
-    expense = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(t.amount), 0)
-        {query_base}
-        AND t.kind = 'EXPENSE'
-        """,
-        params_base
-    ).fetchone()[0]
-
-    debt_in = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(t.amount), 0)
-        {query_base}
-        AND t.kind = 'DEBT_IN'
-        """,
-        params_base
-    ).fetchone()[0]
-
-    debt_out = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(t.amount), 0)
-        {query_base}
-        AND t.kind = 'DEBT_OUT'
-        """,
-        params_base
-    ).fetchone()[0]
-
-    conn.close()
-
-    balance = (
-        float(income)
-        - float(expense)
-        + float(debt_in)
-        - float(debt_out)
-    )
-
-    return (
-        float(income),
-        float(expense),
-        float(debt_in),
-        float(debt_out),
-        balance
-    )
-
-
-# =========================================================
-# SUMMA ANIQLASH
-# =========================================================
-
-def find_amounts(text):
-
-    pattern = (
-        r"(\d+(?:[.,]\d+)?)"
-        r"\s*(mln|million|ming|m|k)\b"
-    )
-
-    result = []
-
-    for match in re.finditer(
-        pattern,
-        text.lower()
-    ):
-
-        number = float(
-            match.group(1).replace(",", ".")
-        )
-
-        unit = match.group(2)
-
-        if unit in (
-            "mln",
-            "million",
-            "m"
-        ):
-
-            amount = number * 1_000_000
-
-        else:
-
-            amount = number * 1_000
-
-        result.append({
-            "amount": amount,
-            "start": match.start(),
-            "end": match.end()
-        })
-
-    return result
+def money(n):
+    return f"{float(n):,.0f}".replace(",", " ") + " so'm"
 
 
 # =========================================================
@@ -571,1368 +201,1113 @@ def find_amounts(text):
 # =========================================================
 
 def fast_parse(text):
+    t = text.lower()
 
-    text_lower = text.lower()
+    amount = parse_amount(t)
 
-    # Qarzga oid gaplarni Groqga yuboramiz
+    if not amount:
+        return None
+
+    # Qarzdorlik iboralari bo'lsa AI ga beramiz
     debt_words = [
         "qarz",
-        "qarzdor",
-        "qarzim",
-        "qarzman",
         "qarz oldim",
         "qarz berdim",
-        "qarz qaytardim",
-        "qarzni qaytardim"
+        "qarzim",
+        "qaytardi",
+        "qaytardim",
+        "qarzni",
+        "qarzga",
+        "lend",
+        "borrow",
     ]
 
-    if any(
-        word in text_lower
-        for word in debt_words
-    ):
+    if any(x in t for x in debt_words):
+        return None
 
-        return []
-
-    amounts = find_amounts(text)
-
-    if not amounts:
-        return []
-
-    results = []
-
+    # INCOME
     income_words = [
         "tushdi",
         "tushum",
+        "oldim",
         "keldi",
         "daromad",
-        "kirim",
-        "oldim",
-        "berdi",
-        "berishdi"
+        "sotdim",
+        "mijozdan",
+        "klientdan",
+        "pul keldi",
     ]
 
+    if any(x in t for x in income_words):
+        category = "Tushum"
+
+        for word in [
+            "klientdan",
+            "mijozdan",
+            "reklamadan",
+            "ishdan",
+            "sotuvdan",
+        ]:
+            if word in t:
+                category = word.capitalize()
+                break
+
+        return [{
+            "type": "INCOME",
+            "amount": amount,
+            "person": None,
+            "category": category,
+            "note": text
+        }]
+
+    # EXPENSE
     expense_words = [
         "ketdi",
-        "chiqdi",
         "sarfladim",
         "sarflandi",
+        "oldim",
         "to'ladim",
         "toladim",
         "xarajat",
-        "materialga",
-        "ishchiga",
-        "ijaraga",
-        "berdim",
-        "sotib oldim"
+        "uchun",
+        "ga ketdi",
     ]
 
-    for item in amounts:
+    if any(x in t for x in expense_words):
 
-        start = max(
-            0,
-            item["start"] - 100
-        )
+        category = "Xarajat"
 
-        end = min(
-            len(text_lower),
-            item["end"] + 100
-        )
+        if "material" in t:
+            category = "Material"
+        elif "ishchi" in t:
+            category = "Ishchi"
+        elif "reklama" in t:
+            category = "Reklama"
+        elif "transport" in t:
+            category = "Transport"
+        elif "ovqat" in t:
+            category = "Ovqat"
 
-        area = text_lower[
-            start:end
-        ]
+        return [{
+            "type": "EXPENSE",
+            "amount": amount,
+            "person": None,
+            "category": category,
+            "note": text
+        }]
 
-        kind = None
-
-        if any(
-            word in area
-            for word in expense_words
-        ):
-
-            kind = "EXPENSE"
-
-        elif any(
-            word in area
-            for word in income_words
-        ):
-
-            kind = "INCOME"
-
-        if not kind:
-            continue
-
-        before = text[
-            :item["start"]
-        ]
-
-        before = re.sub(
-            r"\b(bugun|kecha|menga|men|pul)\b",
-            "",
-            before,
-            flags=re.I
-        )
-
-        before = re.sub(
-            r"\s+",
-            " ",
-            before
-        ).strip(" ,.-")
-
-        if not before:
-
-            category = (
-                "Tushum"
-                if kind == "INCOME"
-                else "Xarajat"
-            )
-
-        else:
-
-            words = before.split()
-
-            category = " ".join(
-                words[-5:]
-            )
-
-        results.append({
-            "type": kind,
-            "amount": item["amount"],
-            "category": category[:100],
-            "note": text[:300]
-        })
-
-    return results
+    return None
 
 
 # =========================================================
-# GROQ PARSER
+# GROQ AI
 # =========================================================
 
-def groq_parse_sync(text):
-
+def groq_parse(text):
     if not GROQ_API_KEY:
-        return []
+        return None
 
-    system_prompt = """
-Sen MyFinance AI moliyaviy botisan.
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
-Foydalanuvchi o'zbek tilida pul harakatlarini yozadi.
+    system = """
+Sen MyFinance AI nomli pul hisob botining parserisan.
 
-MUHIM:
+Foydalanuvchi yozgan gapni pul operatsiyalariga ajrat.
 
-1. Oddiy klientdan kelgan pul:
-INCOME
+Faqat JSON qaytar.
 
-2. Oddiy xarajat:
-EXPENSE
-
-3. Qarzga oid real pul harakati:
-
-Birovdan qarz oldim:
-DEBT_IN
-
-Birovga qarz berdim:
-DEBT_OUT
-
-Oldin olgan qarzimni qaytardim:
-DEBT_OUT
-
-Menga bergan qarzini qaytardi:
-DEBT_IN
-
-Qarzning o'zi INCOME yoki EXPENSE emas.
-
-Lekin haqiqiy pul kirsa yoki chiqsa balansga ta'sir qiladi.
-
-Misollar:
-
-"Klientdan 5 mln tushdi"
-INCOME 5000000
-
-"Materialga 1.2 mln ketdi"
-EXPENSE 1200000
-
-"Azizdan 3 mln qarz oldim"
-DEBT_IN 3000000
-
-"Valiga 500 ming qarz berdim"
-DEBT_OUT 500000
-
-"Aziz qarzini 3 mln qaytardi"
-DEBT_IN 3000000
-
-"Azizga olgan 3 mln qarzimni qaytardim"
-DEBT_OUT 3000000
-
-Agar:
-"Azizdan 5 mln qarzim bor"
-
-Bu real pul harakati emas.
-Transaction yaratma.
-
-Summalar:
-
-5 mln = 5000000
-1.2 mln = 1200000
-800 ming = 800000
-500 ming = 500000
-
-Bir gapda bir nechta operatsiya bo'lsa,
-ularni alohida qaytar.
-
-category qisqa va tushunarli bo'lsin.
-
-Personni ham aniqlashga harakat qil:
-Azizdan -> Aziz
-Valiga -> Vali
-Azizga -> Aziz
-
-Faqat JSON qaytar:
+Format:
 
 {
   "transactions": [
     {
-      "type": "INCOME",
-      "amount": 5000000,
-      "category": "Klientdan",
+      "type": "INCOME | EXPENSE | DEBT_IN | DEBT_OUT",
+      "amount": 0,
       "person": null,
-      "note": "..."
+      "category": "",
+      "note": "",
+      "debt_action": "NEW | REPAY | NONE"
     }
   ]
 }
 
-type faqat:
+Qoidalar:
 
-INCOME
-EXPENSE
-DEBT_IN
-DEBT_OUT
+INCOME:
+Pul foydalanuvchiga oddiy daromad/tushum sifatida keldi.
 
-bo'lishi mumkin.
+EXPENSE:
+Pul foydalanuvchidan oddiy xarajat sifatida chiqdi.
 
-Hech qanday markdown yozma.
-Faqat JSON.
+DEBT_IN:
+Foydalanuvchi boshqa odamdan qarz oldi.
+Bu pul balansni oshiradi.
+
+DEBT_OUT:
+Foydalanuvchi boshqa odamga qarz berdi.
+Bu pul balansni kamaytiradi.
+
+Qarz qaytarish:
+- Foydalanuvchi o'zi olgan qarzni qaytarsa -> EXPENSE + debt_action REPAY
+- Boshqa odam foydalanuvchiga qarzini qaytarsa -> INCOME + debt_action REPAY
+
+Faqat "Azizga 5 mln qarzim bor" kabi gaplarda pul harakati bo'lmasa,
+hech qanday transaction yaratma.
+
+Bir gapda bir nechta operatsiya bo'lsa hammasini chiqar.
+
+Misol:
+"Klientdan 5 mln tushdi, materialga 1.2 mln, ishchiga 800 ming ketdi"
+
+{
+ "transactions": [
+   {
+    "type":"INCOME",
+    "amount":5000000,
+    "person":null,
+    "category":"Klient",
+    "note":"Klientdan 5 mln tushdi",
+    "debt_action":"NONE"
+   },
+   {
+    "type":"EXPENSE",
+    "amount":1200000,
+    "person":null,
+    "category":"Material",
+    "note":"Materialga 1.2 mln",
+    "debt_action":"NONE"
+   },
+   {
+    "type":"EXPENSE",
+    "amount":800000,
+    "person":null,
+    "category":"Ishchi",
+    "note":"Ishchiga 800 ming",
+    "debt_action":"NONE"
+   }
+ ]
+}
+
+Faqat JSON qaytar.
 """
 
     payload = {
         "model": GROQ_MODEL,
-
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": text
-            }
-        ],
-
         "temperature": 0,
-
-        "response_format": {
-            "type": "json_object"
-        },
-
-        "max_tokens": 800
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text}
+        ]
     }
 
     headers = {
-        "Authorization":
-            f"Bearer {GROQ_API_KEY}",
-
-        "Content-Type":
-            "application/json"
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
 
     try:
-
-        response = requests.post(
-            GROQ_URL,
+        r = requests.post(
+            url,
             headers=headers,
             json=payload,
-            timeout=15
+            timeout=20
         )
 
-        response.raise_for_status()
+        r.raise_for_status()
 
-        data = response.json()
+        data = r.json()
 
-        content = data[
-            "choices"
-        ][0][
-            "message"
-        ][
-            "content"
-        ]
+        content = data["choices"][0]["message"]["content"].strip()
+
+        # Markdown JSON bo'lsa tozalash
+        content = re.sub(r"^```json", "", content)
+        content = re.sub(r"^```", "", content)
+        content = re.sub(r"```$", "", content)
+        content = content.strip()
 
         parsed = json.loads(content)
 
-        transactions = parsed.get(
-            "transactions",
-            []
-        )
-
-        clean = []
-
-        for item in transactions:
-
-            transaction_type = item.get(
-                "type"
-            )
-
-            if transaction_type not in (
-                "INCOME",
-                "EXPENSE",
-                "DEBT_IN",
-                "DEBT_OUT"
-            ):
-                continue
-
-            try:
-
-                amount = float(
-                    item.get(
-                        "amount",
-                        0
-                    )
-                )
-
-            except:
-
-                continue
-
-            if amount <= 0:
-                continue
-
-            person = item.get(
-                "person"
-            )
-
-            if person:
-                person = str(
-                    person
-                ).strip()[:100]
-
-            clean.append({
-                "type": transaction_type,
-
-                "amount": amount,
-
-                "category": str(
-                    item.get(
-                        "category"
-                    )
-                    or "Operatsiya"
-                )[:100],
-
-                "person": person,
-
-                "note": str(
-                    item.get(
-                        "note"
-                    )
-                    or text
-                )[:300]
-            })
-
-        return clean
+        return parsed.get("transactions", [])
 
     except Exception as e:
-
-        print(
-            "GROQ ERROR:",
-            repr(e)
-        )
-
-        return []
+        print("GROQ ERROR:", repr(e))
+        return None
 
 
-async def groq_parse(text):
+def parse_text(text):
+    fast = fast_parse(text)
 
-    return await asyncio.to_thread(
-        groq_parse_sync,
-        text
-    )
+    if fast:
+        print("FAST:", fast)
+        return fast
+
+    ai = groq_parse(text)
+
+    print("AI:", ai)
+
+    return ai
 
 
 # =========================================================
-# QARZNI SAQLASH
+# DEBT
 # =========================================================
 
-def update_debt(
-    user_id,
-    person,
-    transaction_type,
-    amount
-):
-
+def add_debt(user_id, period_id, person, amount, debt_type):
     if not person:
         person = "Noma'lum"
 
-    conn = get_db()
+    conn = db()
+    cur = conn.cursor()
 
-    # Men qarz oldim
-    # -> men unga qarzman
-    if transaction_type == "DEBT_IN":
+    cur.execute("""
+        INSERT INTO debts
+        (user_id, period_id, person, amount, debt_type)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        user_id,
+        period_id,
+        person,
+        amount,
+        debt_type
+    ))
 
-        debt_type = "I_OWE"
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    # Men qarz berdim
-    # -> u menga qarz
-    else:
 
-        debt_type = "OWES_ME"
+def change_debt(user_id, period_id, person, amount, debt_type):
+    if not person:
+        return
 
-    # Mavjud qarzni topamiz
-    row = conn.execute("""
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
         SELECT id, amount
         FROM debts
-        WHERE user_id = ?
-        AND person = ?
-        AND debt_type = ?
+        WHERE user_id = %s
+          AND period_id = %s
+          AND person = %s
+          AND debt_type = %s
+          AND amount > 0
+        ORDER BY id
+        LIMIT 1
+    """, (
+        user_id,
+        period_id,
+        person,
+        debt_type
+    ))
+
+    row = cur.fetchone()
+
+    if row:
+        new_amount = float(row["amount"]) - float(amount)
+
+        if new_amount <= 0:
+            cur.execute(
+                "DELETE FROM debts WHERE id = %s",
+                (row["id"],)
+            )
+        else:
+            cur.execute("""
+                UPDATE debts
+                SET amount = %s
+                WHERE id = %s
+            """, (
+                new_amount,
+                row["id"]
+            ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# =========================================================
+# SAVE TRANSACTIONS
+# =========================================================
+
+def save_transactions(user_id, items):
+    period_id = get_current_period(user_id)
+
+    saved = []
+
+    conn = db()
+    cur = conn.cursor()
+
+    for item in items:
+
+        kind = item.get("type")
+        amount = float(item.get("amount") or 0)
+
+        if amount <= 0:
+            continue
+
+        person = item.get("person")
+        category = item.get("category") or "Xarajat"
+        note = item.get("note") or ""
+        debt_action = item.get("debt_action", "NONE")
+
+        if kind not in [
+            "INCOME",
+            "EXPENSE",
+            "DEBT_IN",
+            "DEBT_OUT"
+        ]:
+            continue
+
+        # Qarzning o'zi bo'lsa
+        if kind == "DEBT_IN":
+            category = "Qarzdan kirim"
+
+        elif kind == "DEBT_OUT":
+            category = "Qarzga chiqim"
+
+        cur.execute("""
+            INSERT INTO transactions
+            (user_id, period_id, kind, amount, person, category, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            user_id,
+            period_id,
+            kind,
+            amount,
+            person,
+            category,
+            note
+        ))
+
+        transaction_id = cur.fetchone()["id"]
+
+        # Yangi qarz
+        if kind == "DEBT_IN":
+            add_debt(
+                user_id,
+                period_id,
+                person,
+                amount,
+                "I_OWE"
+            )
+
+        elif kind == "DEBT_OUT":
+            add_debt(
+                user_id,
+                period_id,
+                person,
+                amount,
+                "OWES_ME"
+            )
+
+        # Qarz qaytarish
+        elif debt_action == "REPAY":
+
+            if kind == "EXPENSE":
+                change_debt(
+                    user_id,
+                    period_id,
+                    person,
+                    amount,
+                    "I_OWE"
+                )
+
+            elif kind == "INCOME":
+                change_debt(
+                    user_id,
+                    period_id,
+                    person,
+                    amount,
+                    "OWES_ME"
+                )
+
+        saved.append({
+            "id": transaction_id,
+            "type": kind,
+            "amount": amount,
+            "category": category
+        })
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return saved
+
+
+# =========================================================
+# BALANCE / REPORT
+# =========================================================
+
+def get_report(user_id):
+    period_id = get_current_period(user_id)
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(
+                CASE
+                    WHEN kind IN ('INCOME', 'DEBT_IN')
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS incoming,
+
+            COALESCE(SUM(
+                CASE
+                    WHEN kind IN ('EXPENSE', 'DEBT_OUT')
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS outgoing,
+
+            COALESCE(SUM(
+                CASE
+                    WHEN kind = 'INCOME'
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS income,
+
+            COALESCE(SUM(
+                CASE
+                    WHEN kind = 'EXPENSE'
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS expense,
+
+            COALESCE(SUM(
+                CASE
+                    WHEN kind = 'DEBT_IN'
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS debt_in,
+
+            COALESCE(SUM(
+                CASE
+                    WHEN kind = 'DEBT_OUT'
+                    THEN amount
+                    ELSE 0
+                END
+            ), 0) AS debt_out
+
+        FROM transactions
+        WHERE user_id = %s
+          AND period_id = %s
+    """, (
+        user_id,
+        period_id
+    ))
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    income = float(row["income"])
+    expense = float(row["expense"])
+    debt_in = float(row["debt_in"])
+    debt_out = float(row["debt_out"])
+
+    balance = income + debt_in - expense - debt_out
+
+    return {
+        "income": income,
+        "expense": expense,
+        "debt_in": debt_in,
+        "debt_out": debt_out,
+        "balance": balance
+    }
+
+
+def get_transactions(user_id, kind=None):
+    period_id = get_current_period(user_id)
+
+    conn = db()
+    cur = conn.cursor()
+
+    if kind:
+        cur.execute("""
+            SELECT *
+            FROM transactions
+            WHERE user_id = %s
+              AND period_id = %s
+              AND kind = %s
+            ORDER BY id DESC
+            LIMIT 50
+        """, (
+            user_id,
+            period_id,
+            kind
+        ))
+    else:
+        cur.execute("""
+            SELECT *
+            FROM transactions
+            WHERE user_id = %s
+              AND period_id = %s
+            ORDER BY id DESC
+            LIMIT 50
+        """, (
+            user_id,
+            period_id
+        ))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return rows
+
+
+# =========================================================
+# DEBT LIST
+# =========================================================
+
+def get_debts(user_id):
+    period_id = get_current_period(user_id)
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT person, amount, debt_type
+        FROM debts
+        WHERE user_id = %s
+          AND period_id = %s
+          AND amount > 0
+        ORDER BY id DESC
+    """, (
+        user_id,
+        period_id
+    ))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return rows
+
+
+# =========================================================
+# DELETE LAST
+# =========================================================
+
+def delete_last_transaction(user_id):
+    period_id = get_current_period(user_id)
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM transactions
+        WHERE user_id = %s
+          AND period_id = %s
         ORDER BY id DESC
         LIMIT 1
     """, (
         user_id,
-        person,
-        debt_type
-    )).fetchone()
+        period_id
+    ))
 
-    if row:
-
-        new_amount = (
-            float(row["amount"])
-            + float(amount)
-        )
-
-        conn.execute("""
-            UPDATE debts
-            SET amount = ?
-            WHERE id = ?
-        """, (
-            new_amount,
-            row["id"]
-        ))
-
-    else:
-
-        conn.execute("""
-            INSERT INTO debts
-            (
-                user_id,
-                person,
-                amount,
-                debt_type
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            user_id,
-            person,
-            amount,
-            debt_type
-        ))
-
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
-# QARZNI QAYTARISH
-# =========================================================
-
-def repay_debt(
-    user_id,
-    person,
-    transaction_type,
-    amount
-):
-
-    if not person:
-        person = "Noma'lum"
-
-    conn = get_db()
-
-    # DEBT_OUT:
-    # Avval men qarzman -> I_OWE kamayadi
-    #
-    # DEBT_IN:
-    # U menga qarz -> OWES_ME kamayadi
-
-    if transaction_type == "DEBT_OUT":
-
-        debt_type = "I_OWE"
-
-    else:
-
-        debt_type = "OWES_ME"
-
-    row = conn.execute("""
-        SELECT id, amount
-        FROM debts
-        WHERE user_id = ?
-        AND person = ?
-        AND debt_type = ?
-        ORDER BY id ASC
-        LIMIT 1
-    """, (
-        user_id,
-        person,
-        debt_type
-    )).fetchone()
+    row = cur.fetchone()
 
     if not row:
-
+        cur.close()
         conn.close()
+        return None
 
-        return
+    # Qarz transaction bo'lsa, debtni ham teskari qilamiz
+    if row["kind"] == "DEBT_IN":
+        cur.execute("""
+            SELECT id, amount
+            FROM debts
+            WHERE user_id = %s
+              AND period_id = %s
+              AND person = %s
+              AND debt_type = 'I_OWE'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (
+            user_id,
+            period_id,
+            row["person"]
+        ))
 
-    current = float(
-        row["amount"]
+        debt = cur.fetchone()
+
+        if debt:
+            new_amount = float(debt["amount"]) - float(row["amount"])
+
+            if new_amount <= 0:
+                cur.execute(
+                    "DELETE FROM debts WHERE id = %s",
+                    (debt["id"],)
+                )
+            else:
+                cur.execute("""
+                    UPDATE debts
+                    SET amount = %s
+                    WHERE id = %s
+                """, (
+                    new_amount,
+                    debt["id"]
+                ))
+
+    elif row["kind"] == "DEBT_OUT":
+        cur.execute("""
+            SELECT id, amount
+            FROM debts
+            WHERE user_id = %s
+              AND period_id = %s
+              AND person = %s
+              AND debt_type = 'OWES_ME'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (
+            user_id,
+            period_id,
+            row["person"]
+        ))
+
+        debt = cur.fetchone()
+
+        if debt:
+            new_amount = float(debt["amount"]) - float(row["amount"])
+
+            if new_amount <= 0:
+                cur.execute(
+                    "DELETE FROM debts WHERE id = %s",
+                    (debt["id"],)
+                )
+            else:
+                cur.execute("""
+                    UPDATE debts
+                    SET amount = %s
+                    WHERE id = %s
+                """, (
+                    new_amount,
+                    debt["id"]
+                ))
+
+    cur.execute(
+        "DELETE FROM transactions WHERE id = %s",
+        (row["id"],)
     )
 
-    remaining = current - float(amount)
-
-    if remaining <= 0:
-
-        conn.execute("""
-            DELETE FROM debts
-            WHERE id = ?
-        """, (
-            row["id"],
-        ))
-
-    else:
-
-        conn.execute("""
-            UPDATE debts
-            SET amount = ?
-            WHERE id = ?
-        """, (
-            remaining,
-            row["id"]
-        ))
-
     conn.commit()
+    cur.close()
     conn.close()
+
+    return row
 
 
 # =========================================================
-# KLAVIATURA
+# TELEGRAM KEYBOARD
 # =========================================================
 
 def keyboard():
-
-    return InlineKeyboardMarkup([
-
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "💰 Tushumlar",
-                callback_data="income"
-            ),
-
-            InlineKeyboardButton(
-                "💸 Xarajatlar",
-                callback_data="expense"
-            )
+            ["💰 Tushumlar", "💸 Xarajatlar"],
+            ["📊 Hisobot", "🤝 Qarzlar"],
+            ["🗑 Oxirgisini o'chirish"],
+            ["🔄 Yangi hisob — 0 dan"],
         ],
-
-        [
-            InlineKeyboardButton(
-                "📊 Hisobot",
-                callback_data="report"
-            ),
-
-            InlineKeyboardButton(
-                "🤝 Qarzlar",
-                callback_data="debts"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🗑 Oxirgisini o‘chirish",
-                callback_data="delete"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔄 Yangi hisob — 0 dan",
-                callback_data="new_period"
-            )
-        ]
-
-    ])
+        resize_keyboard=True
+    )
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
-async def start(update, context):
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Userda hali period bo'lmasa yaratadi.
-    # MUHIM: yangi period ochmaydi.
     get_current_period(user_id)
 
     await update.message.reply_text(
-        """
-💰 MyFinance AI
-
-Pul kirimi va xarajatlaringni yozaver.
-
-Masalan:
-
-Klientdan 5 mln tushdi
-
-Materialga 1.2 mln ketdi
-
-Ishchiga 800 ming berdim
-
-Qarz:
-
-Azizdan 3 mln qarz oldim
-
-Valiga 500 ming qarz berdim
-
-Aziz qarzini 500 ming qaytardi
-
-Eski hisobni saqlagan holda 0 dan boshlash uchun:
-
-🔄 Yangi hisob — 0 dan
-        """,
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# TRANZAKSIYALARNI SAQLASH
-# =========================================================
-
-async def save_transactions(
-    update,
-    transactions
-):
-
-    user_id = update.effective_user.id
-
-    lines = []
-
-    for item in transactions:
-
-        transaction_type = item["type"]
-
-        person = item.get(
-            "person"
-        )
-
-        # Oddiy transaction
-        add_transaction(
-            user_id=user_id,
-            kind=transaction_type,
-            amount=item["amount"],
-            category=item["category"],
-            note=item["note"],
-            person=person
-        )
-
-        # Qarz bazasini yangilash
-        if transaction_type == "DEBT_IN":
-
-            # Bu yangi qarzmi yoki qaytarilgan qarzmi?
-            text_lower = item["note"].lower()
-
-            repayment_words = [
-                "qaytardi",
-                "qaytardi",
-                "qaytarib berdi",
-                "qarzini berdi",
-                "qarzini qaytardi"
-            ]
-
-            if any(
-                word in text_lower
-                for word in repayment_words
-            ):
-
-                repay_debt(
-                    user_id,
-                    person,
-                    "DEBT_IN",
-                    item["amount"]
-                )
-
-            else:
-
-                update_debt(
-                    user_id,
-                    person,
-                    "DEBT_IN",
-                    item["amount"]
-                )
-
-        elif transaction_type == "DEBT_OUT":
-
-            text_lower = item["note"].lower()
-
-            repayment_words = [
-                "qaytardim",
-                "qaytarib berdim",
-                "qarzimni qaytardim",
-                "qarzni qaytardim"
-            ]
-
-            if any(
-                word in text_lower
-                for word in repayment_words
-            ):
-
-                repay_debt(
-                    user_id,
-                    person,
-                    "DEBT_OUT",
-                    item["amount"]
-                )
-
-            else:
-
-                update_debt(
-                    user_id,
-                    person,
-                    "DEBT_OUT",
-                    item["amount"]
-                )
-
-        # Javob
-        if transaction_type == "INCOME":
-
-            lines.append(
-                f"💰 {item['category']} — "
-                f"{money(item['amount'])} so'm"
-            )
-
-        elif transaction_type == "EXPENSE":
-
-            lines.append(
-                f"💸 {item['category']} — "
-                f"{money(item['amount'])} so'm"
-            )
-
-        elif transaction_type == "DEBT_IN":
-
-            lines.append(
-                f"🤝 Qarzdan kirim — "
-                f"{money(item['amount'])} so'm"
-            )
-
-        elif transaction_type == "DEBT_OUT":
-
-            lines.append(
-                f"🤝 Qarzga chiqim — "
-                f"{money(item['amount'])} so'm"
-            )
-
-    balance = get_balance(
-        user_id
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"🟢 Qoldiq: "
-        f"{money(balance)} so'm"
-    )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# XABAR
-# =========================================================
-
-async def message_handler(
-    update,
-    context
-):
-
-    text = update.message.text.strip()
-
-    if not text:
-        return
-
-    print(
-        f"USER {update.effective_user.id}: "
-        f"{text}"
-    )
-
-    # Avval tezkor parser
-    transactions = fast_parse(text)
-
-    if transactions:
-
-        print(
-            "FAST:",
-            transactions
-        )
-
-        await save_transactions(
-            update,
-            transactions
-        )
-
-        return
-
-    # Keyin Groq
-    if GROQ_API_KEY:
-
-        msg = await update.message.reply_text(
-            "⏳ Tushunib olayapman..."
-        )
-
-        transactions = await groq_parse(
-            text
-        )
-
-        try:
-            await msg.delete()
-        except:
-            pass
-
-        if transactions:
-
-            print(
-                "GROQ:",
-                transactions
-            )
-
-            await save_transactions(
-                update,
-                transactions
-            )
-
-            return
-
-    await update.message.reply_text(
-        "❓ Tushunmadim.\n\n"
+        "👋 MyFinance AI ga xush kelibsiz!\n\n"
+        "Pul harakatini oddiy tilda yozing.\n\n"
         "Masalan:\n"
-        "Klientdan 5 mln tushdi\n"
-        "Materialga 1.2 mln ketdi\n"
-        "Azizdan 3 mln qarz oldim",
+        "• Klientdan 5 mln tushdi\n"
+        "• Materialga 1.2 mln ketdi\n"
+        "• Ishchiga 800 ming berdim\n\n"
+        "Bot avtomatik hisoblaydi.",
         reply_markup=keyboard()
     )
 
 
 # =========================================================
-# TUSHUMLAR
+# INCOME
 # =========================================================
 
-async def show_income(query):
-
+async def show_income(update, context):
     rows = get_transactions(
-        query.from_user.id,
-        kind="INCOME",
-        days=30
+        update.effective_user.id,
+        "INCOME"
     )
 
     if not rows:
-
-        await query.edit_message_text(
-            "💰 Tushumlar yo‘q.",
+        await update.message.reply_text(
+            "💰 Hozircha tushum yo'q.",
             reply_markup=keyboard()
         )
-
         return
 
-    lines = [
-        "💰 TUSHUMLAR — 30 KUN",
-        ""
-    ]
+    total = sum(float(x["amount"]) for x in rows)
 
-    total = 0
+    text = "💰 TUSHUMLAR\n\n"
 
-    for row in rows[:50]:
-
-        amount = float(
-            row["amount"]
+    for row in reversed(rows):
+        text += (
+            f"• {row['category']}: "
+            f"{money(row['amount'])}\n"
         )
 
-        category = (
-            row["category"]
-            or "Tushum"
-        )
+    text += f"\nJami: {money(total)}"
 
-        total += amount
-
-        lines.append(
-            f"• {category} — "
-            f"{money(amount)} so'm"
-        )
-
-    lines.append("")
-
-    lines.append(
-        f"Jami: "
-        f"{money(total)} so'm"
-    )
-
-    await query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# XARAJATLAR
-# =========================================================
-
-async def show_expenses(query):
-
-    rows = get_transactions(
-        query.from_user.id,
-        kind="EXPENSE",
-        days=30
-    )
-
-    if not rows:
-
-        await query.edit_message_text(
-            "💸 Xarajatlar yo‘q.",
-            reply_markup=keyboard()
-        )
-
-        return
-
-    lines = [
-        "💸 XARAJATLAR — 30 KUN",
-        ""
-    ]
-
-    total = 0
-
-    for row in rows[:50]:
-
-        amount = float(
-            row["amount"]
-        )
-
-        category = (
-            row["category"]
-            or "Xarajat"
-        )
-
-        total += amount
-
-        lines.append(
-            f"• {category} — "
-            f"{money(amount)} so'm"
-        )
-
-    lines.append("")
-
-    lines.append(
-        f"Jami: "
-        f"{money(total)} so'm"
-    )
-
-    await query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# HISOBOT
-# =========================================================
-
-async def show_report(query):
-
-    (
-        income,
-        expense,
-        debt_in,
-        debt_out,
-        balance
-    ) = get_report(
-        query.from_user.id,
-        days=30
-    )
-
-    text = (
-        "📊 HISOBOT — 30 KUN\n\n"
-
-        f"💰 Tushum: "
-        f"{money(income)} so'm\n"
-
-        f"💸 Xarajat: "
-        f"{money(expense)} so'm\n\n"
-
-        f"🤝 Qarzdan kirim: "
-        f"{money(debt_in)} so'm\n"
-
-        f"🤝 Qarzga chiqim: "
-        f"{money(debt_out)} so'm\n\n"
-
-        f"🟢 Qoldiq: "
-        f"{money(balance)} so'm"
-    )
-
-    await query.edit_message_text(
+    await update.message.reply_text(
         text,
         reply_markup=keyboard()
     )
 
 
 # =========================================================
-# QARZLAR
+# EXPENSE
 # =========================================================
 
-def get_debts(user_id):
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT
-            person,
-            debt_type,
-            SUM(amount) AS total
-        FROM debts
-        WHERE user_id = ?
-        AND debt_type IN (
-            'I_OWE',
-            'OWES_ME'
-        )
-        GROUP BY person, debt_type
-    """, (
-        user_id,
-    )).fetchall()
-
-    conn.close()
-
-    people = {}
-
-    for row in rows:
-
-        person = (
-            row["person"]
-            or "Noma'lum"
-        )
-
-        if person not in people:
-
-            people[person] = {
-                "I_OWE": 0,
-                "OWES_ME": 0
-            }
-
-        people[
-            person
-        ][
-            row["debt_type"]
-        ] = float(
-            row["total"]
-        )
-
-    return people
-
-
-async def show_debts(query):
-
-    people = get_debts(
-        query.from_user.id
+async def show_expenses(update, context):
+    rows = get_transactions(
+        update.effective_user.id,
+        "EXPENSE"
     )
 
-    if not people:
-
-        await query.edit_message_text(
-            "🤝 Qarzlar yo‘q.",
+    if not rows:
+        await update.message.reply_text(
+            "💸 Hozircha xarajat yo'q.",
             reply_markup=keyboard()
         )
-
         return
 
-    lines = [
-        "🤝 QARZLAR",
-        ""
-    ]
+    total = sum(float(x["amount"]) for x in rows)
 
-    for person, data in people.items():
+    text = "💸 XARAJATLAR\n\n"
 
-        i_owe = data["I_OWE"]
-        owes_me = data["OWES_ME"]
+    for row in reversed(rows):
+        text += (
+            f"• {row['category']}: "
+            f"{money(row['amount'])}\n"
+        )
 
-        if i_owe:
+    text += f"\nJami: {money(total)}"
 
-            lines.append(
-                f"🔴 {person}: "
-                f"men {money(i_owe)} "
-                f"so'm qarzman"
-            )
-
-        if owes_me:
-
-            lines.append(
-                f"🟢 {person}: "
-                f"menga {money(owes_me)} "
-                f"so'm qarz"
-            )
-
-        net = owes_me - i_owe
-
-        if net > 0:
-
-            lines.append(
-                f"   → {person} menga "
-                f"{money(net)} so'm qarz"
-            )
-
-        elif net < 0:
-
-            lines.append(
-                f"   → Men {person}ga "
-                f"{money(abs(net))} "
-                f"so'm qarzman"
-            )
-
-        lines.append("")
-
-    await query.edit_message_text(
-        "\n".join(lines),
+    await update.message.reply_text(
+        text,
         reply_markup=keyboard()
     )
 
 
 # =========================================================
-# O'CHIRISH
+# REPORT
 # =========================================================
 
-async def delete_last(query):
+async def show_report(update, context):
+    r = get_report(update.effective_user.id)
 
+    text = (
+        "📊 HISOBOT\n\n"
+        f"💰 Tushum: {money(r['income'])}\n"
+        f"💸 Xarajat: {money(r['expense'])}\n\n"
+        f"🤝 Qarzdan kirim: {money(r['debt_in'])}\n"
+        f"🤝 Qarzga chiqim: {money(r['debt_out'])}\n\n"
+        f"🟢 Qoldiq: {money(r['balance'])}"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=keyboard()
+    )
+
+
+# =========================================================
+# DEBTS
+# =========================================================
+
+async def show_debts(update, context):
+    rows = get_debts(update.effective_user.id)
+
+    if not rows:
+        await update.message.reply_text(
+            "🤝 Hozircha qarz yo'q.",
+            reply_markup=keyboard()
+        )
+        return
+
+    owe = []
+    owed = []
+
+    for row in rows:
+        if row["debt_type"] == "I_OWE":
+            owe.append(row)
+        elif row["debt_type"] == "OWES_ME":
+            owed.append(row)
+
+    text = "🤝 QARZLAR\n\n"
+
+    if owe:
+        text += "🔴 MEN QARZDORMAN:\n"
+        for row in owe:
+            text += (
+                f"• {row['person']}: "
+                f"{money(row['amount'])}\n"
+            )
+        text += "\n"
+
+    if owed:
+        text += "🟢 MENGA QARZ:\n"
+        for row in owed:
+            text += (
+                f"• {row['person']}: "
+                f"{money(row['amount'])}\n"
+            )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=keyboard()
+    )
+
+
+# =========================================================
+# DELETE
+# =========================================================
+
+async def delete_last(update, context):
     row = delete_last_transaction(
-        query.from_user.id
+        update.effective_user.id
     )
 
     if not row:
-
-        await query.edit_message_text(
-            "🗑 O‘chirish uchun "
-            "operatsiya yo‘q.",
+        await update.message.reply_text(
+            "🗑 O'chirish uchun transaction yo'q.",
             reply_markup=keyboard()
         )
+        return
+
+    await update.message.reply_text(
+        f"🗑 O'chirildi:\n"
+        f"{row['category']} — {money(row['amount'])}",
+        reply_markup=keyboard()
+    )
+
+
+# =========================================================
+# NEW PERIOD
+# =========================================================
+
+async def new_period(update, context):
+    context.user_data["confirm_new_period"] = True
+
+    await update.message.reply_text(
+        "⚠️ Yangi hisob ochilsinmi?\n\n"
+        "Eski hisoblar o'chirilmaydi.\n"
+        "Faqat hozirgi hisob 0 dan boshlanadi.\n\n"
+        "Tasdiqlash uchun: HA"
+    )
+
+
+# =========================================================
+# MAIN TEXT HANDLER
+# =========================================================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+
+    # Yangi hisob tasdiqlash
+    if context.user_data.get("confirm_new_period"):
+
+        if text.lower() in ["ha", "xa", "yes", "да"]:
+
+            create_new_period(user_id)
+
+            context.user_data["confirm_new_period"] = False
+
+            await update.message.reply_text(
+                "✅ Yangi hisob ochildi.\n\n"
+                "🟢 Qoldiq: 0 so'm\n\n"
+                "Eski hisoblar saqlanib qoldi.",
+                reply_markup=keyboard()
+            )
+
+        else:
+            context.user_data["confirm_new_period"] = False
+
+            await update.message.reply_text(
+                "❌ Bekor qilindi.",
+                reply_markup=keyboard()
+            )
 
         return
 
-    balance = get_balance(
-        query.from_user.id
-    )
+    # BUTTONS
+    if text == "💰 Tushumlar":
+        await show_income(update, context)
+        return
 
-    await query.edit_message_text(
-        "🗑 Oxirgi operatsiya "
-        "o‘chirildi.\n\n"
+    if text == "💸 Xarajatlar":
+        await show_expenses(update, context)
+        return
 
-        f"🟢 Qoldiq: "
-        f"{money(balance)} so'm",
+    if text == "📊 Hisobot":
+        await show_report(update, context)
+        return
 
-        reply_markup=keyboard()
-    )
+    if text == "🤝 Qarzlar":
+        await show_debts(update, context)
+        return
 
+    if text == "🗑 Oxirgisini o'chirish":
+        await delete_last(update, context)
+        return
 
-# =========================================================
-# YANGI HISOB
-# =========================================================
+    if text == "🔄 Yangi hisob — 0 dan":
+        await new_period(update, context)
+        return
 
-async def new_period_confirm(query):
+    # MONEY TEXT
+    print("USER", user_id, ":", text)
 
-    keyboard_confirm = InlineKeyboardMarkup([
+    items = parse_text(text)
 
-        [
-            InlineKeyboardButton(
-                "✅ Ha, 0 dan boshlash",
-                callback_data="new_period_yes"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "❌ Bekor qilish",
-                callback_data="new_period_no"
-            )
-        ]
-
-    ])
-
-    await query.edit_message_text(
-        "⚠️ YANGI HISOB\n\n"
-
-        "Hozirgi hisob 0 dan boshlanadi.\n\n"
-
-        "Eski ma'lumotlar o‘chirilmaydi. "
-        "Faqat yangi hisob davri ochiladi.\n\n"
-
-        "Davom etamizmi?",
-
-        reply_markup=keyboard_confirm
-    )
-
-
-async def new_period_yes(query):
-
-    create_new_period(
-        query.from_user.id
-    )
-
-    await query.edit_message_text(
-        "✅ Yangi hisob boshlandi.\n\n"
-
-        "💰 Tushum: 0 so'm\n"
-
-        "💸 Xarajat: 0 so'm\n"
-
-        "🤝 Qarz harakati: 0 so'm\n\n"
-
-        "🟢 Qoldiq: 0 so'm",
-
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# BUTTON
-# =========================================================
-
-async def button_handler(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if query.data == "income":
-
-        await show_income(query)
-
-    elif query.data == "expense":
-
-        await show_expenses(query)
-
-    elif query.data == "report":
-
-        await show_report(query)
-
-    elif query.data == "debts":
-
-        await show_debts(query)
-
-    elif query.data == "delete":
-
-        await delete_last(query)
-
-    elif query.data == "new_period":
-
-        await new_period_confirm(query)
-
-    elif query.data == "new_period_yes":
-
-        await new_period_yes(query)
-
-    elif query.data == "new_period_no":
-
-        await query.edit_message_text(
-            "❌ Bekor qilindi.",
+    if not items:
+        await update.message.reply_text(
+            "🤔 Tushunmadim.\n\n"
+            "Masalan:\n"
+            "Klientdan 5 mln tushdi\n"
+            "Materialga 1.2 mln ketdi\n"
+            "Azizdan 3 mln qarz oldim",
             reply_markup=keyboard()
         )
+        return
+
+    saved = save_transactions(
+        user_id,
+        items
+    )
+
+    if not saved:
+        await update.message.reply_text(
+            "❌ Operatsiyani saqlab bo'lmadi.",
+            reply_markup=keyboard()
+        )
+        return
+
+    # Natija
+    result = ""
+
+    for item in saved:
+
+        if item["type"] == "INCOME":
+            result += (
+                f"💰 Tushum: "
+                f"{money(item['amount'])}\n"
+            )
+
+        elif item["type"] == "EXPENSE":
+            result += (
+                f"💸 {item['category']}: "
+                f"{money(item['amount'])}\n"
+            )
+
+        elif item["type"] == "DEBT_IN":
+            result += (
+                f"🤝 Qarzdan kirim: "
+                f"{money(item['amount'])}\n"
+            )
+
+        elif item["type"] == "DEBT_OUT":
+            result += (
+                f"🤝 Qarzga chiqim: "
+                f"{money(item['amount'])}\n"
+            )
+
+    report = get_report(user_id)
+
+    result += (
+        f"\n🟢 Qoldiq: "
+        f"{money(report['balance'])}"
+    )
+
+    await update.message.reply_text(
+        result,
+        reply_markup=keyboard()
+    )
 
 
 # =========================================================
 # ERROR
 # =========================================================
 
-async def error_handler(
-    update,
-    context
-):
-
-    print(
-        "BOT ERROR:",
-        repr(context.error)
-    )
+async def error_handler(update, context):
+    print("BOT ERROR:", repr(context.error))
 
 
 # =========================================================
-# MAIN
+# START
 # =========================================================
 
 def main():
 
-    print("=" * 50)
-    print("MyFinance AI")
-    print("=" * 50)
-
-    if "BU_YERGA" in BOT_TOKEN:
-
-        print(
-            "XATO: BOT_TOKEN ni "
-            "bot.py ichiga kiriting!"
-        )
-
-        return
-
-    if "BU_YERGA" in GROQ_API_KEY:
-
-        print(
-            "XATO: GROQ_API_KEY ni "
-            "bot.py ichiga kiriting!"
-        )
-
-        return
-
-    print("Groq: YOQILGAN")
-    print(f"Model: {GROQ_MODEL}")
-
     init_db()
 
     app = (
-        Application
-        .builder()
+        Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
     app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
+        CommandHandler("start", start)
     )
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            message_handler
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
         )
     )
 
-    app.add_error_handler(
-        error_handler
+    app.add_error_handler(error_handler)
+
+    if not RENDER_URL:
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL topilmadi. "
+            "Render Web Service sifatida ishlayotganini tekshiring."
+        )
+
+    webhook_url = (
+        f"{RENDER_URL.rstrip('/')}/{WEBHOOK_PATH}"
     )
 
+    print("Webhook URL:", webhook_url)
     print("BOT ISHLAYAPTI...")
+    print("PORT:", PORT)
 
-    app.run_polling(
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=webhook_url,
         drop_pending_updates=True
     )
 
