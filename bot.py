@@ -2,8 +2,8 @@ import os
 import re
 import json
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
