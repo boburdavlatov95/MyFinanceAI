@@ -50,10 +50,10 @@ print("Port:", PORT)
 # =========================================================
 
 def db():
-return psycopg.connect(
-    DATABASE_URL,
-    row_factory=dict_row,
-    connect_timeout=10
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=10
 )
 
 
