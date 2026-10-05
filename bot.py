@@ -54,7 +54,7 @@ def db():
         DATABASE_URL,
         row_factory=dict_row,
         connect_timeout=10
-)
+    )
 
 
 def init_db():
