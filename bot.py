@@ -120,9 +120,11 @@ def get_current_period(user_id):
 
     if row:
         period_id = row["id"]
+
     else:
         cur.execute("""
-            INSERT INTO finance_periods (user_id, title)
+            INSERT INTO finance_periods
+            (user_id, title)
             VALUES (%s, 'Hisob #1')
             RETURNING id
         """, (user_id,))
@@ -149,7 +151,8 @@ def create_new_period(user_id):
     number = int(cur.fetchone()["cnt"]) + 1
 
     cur.execute("""
-        INSERT INTO finance_periods (user_id, title)
+        INSERT INTO finance_periods
+        (user_id, title)
         VALUES (%s, %s)
         RETURNING id
     """, (
@@ -171,7 +174,11 @@ def create_new_period(user_id):
 # =========================================================
 
 def parse_amount(text):
-    text = text.lower().replace(",", ".").replace(" ", "")
+    text = (
+        text.lower()
+        .replace(",", ".")
+        .replace(" ", "")
+    )
 
     m = re.search(
         r"(\d+(?:\.\d+)?)\s*(mln|million|млн)",
@@ -222,6 +229,7 @@ def money(n):
 
 def fast_parse(text):
     t = text.lower()
+
     amount = parse_amount(t)
 
     if not amount:
@@ -238,7 +246,6 @@ def fast_parse(text):
         "qaytardi",
         "qaytardim",
         "qaytarib",
-        "qaytardi",
         "borrow",
         "lend",
     ]
@@ -273,6 +280,9 @@ def fast_parse(text):
         "sarflandi",
         "to'ladim",
         "toladim",
+        "ishlatdim",
+        "ishlatildi",
+        "sarflab yubordim",
     ]
 
     if (
@@ -283,20 +293,28 @@ def fast_parse(text):
 
         if "material" in t:
             category = "Material"
+
         elif "ishchi" in t:
             category = "Ishchi"
+
         elif "transport" in t:
             category = "Transport"
+
         elif "ovqat" in t:
             category = "Ovqat"
+
         elif "reklama" in t:
             category = "Reklama"
+
         elif "ijara" in t:
             category = "Ijara"
+
         elif "soliq" in t:
             category = "Soliq"
+
         elif "elektr" in t:
             category = "Elektr"
+
         elif "gaz" in t:
             category = "Gaz"
 
@@ -320,6 +338,7 @@ def fast_parse(text):
 # =========================================================
 
 def transcribe_audio(audio_bytes, filename="voice.ogg"):
+
     if not GROQ_API_KEY:
         return None
 
@@ -342,19 +361,22 @@ def transcribe_audio(audio_bytes, filename="voice.ogg"):
 
     data = {
         "model": WHISPER_MODEL,
-        "language": "uz",
         "response_format": "json",
         "temperature": "0",
         "prompt": (
-            "O'zbek tilidagi pul hisoboti. "
-            "So'm, mln, million, ming, tushdi, "
-            "keldi, ketdi, berdim, oldim, qarz, "
-            "qarzdor, qaytardi, material, ishchi, "
-            "klient, mijoz kabi so'zlar bo'lishi mumkin."
+            "O'zbek tilidagi moliyaviy suhbat. "
+            "Pul summalarini aniq eshitib yoz. "
+            "So'm, ming, million, mln, mingta, "
+            "qarz, qarzdor, qaytardi, qaytardim, "
+            "berdim, oldim, tushdi, keldi, ketdi, "
+            "sarfladim, ishlatdim kabi so'zlar bo'lishi mumkin. "
+            "Ads, Aziz, Jasur kabi odam nomlarini "
+            "imkon qadar aniq yoz."
         )
     }
 
     try:
+
         r = requests.post(
             url,
             headers=headers,
@@ -367,15 +389,290 @@ def transcribe_audio(audio_bytes, filename="voice.ogg"):
 
         result = r.json()
 
-        text = result.get("text", "").strip()
+        text = result.get(
+            "text",
+            ""
+        ).strip()
 
-        print("VOICE TEXT:", text)
+        print(
+            "VOICE RAW:",
+            text
+        )
 
         return text if text else None
 
     except Exception as e:
-        print("VOICE ERROR:", repr(e))
+
+        print(
+            "VOICE ERROR:",
+            repr(e)
+        )
+
         return None
+
+
+# =========================================================
+# VOICE TEXT NORMALIZER
+# =========================================================
+
+def normalize_voice_text(text):
+
+    if not text:
+        return text
+
+    if not GROQ_API_KEY:
+        return text
+
+    url = (
+        "https://api.groq.com/openai/v1/"
+        "chat/completions"
+    )
+
+    system = """
+Sen MyFinance AI uchun O'ZBEKCHA OVOZLI XABARNI
+tozalovchi yordamchisan.
+
+Whisper chiqargan matnni moliyaviy parser
+oson tushunadigan aniq matnga aylantir.
+
+ASOSIY QOIDA:
+
+Gapning ma'nosini O'ZGARTIRMA.
+
+Faqat noto'g'ri tanilgan so'zlar,
+raqamlar va pul birliklarini tuzat.
+
+=========================================================
+1. SONLARNI RAQAMGA AYLANTIR
+=========================================================
+
+"yetti yuz ming"
+→ "700 ming"
+
+"to'rt yuz ming"
+→ "400 ming"
+
+"besh yuz ming"
+→ "500 ming"
+
+"besh million"
+→ "5 mln"
+
+"bir million"
+→ "1 mln"
+
+"ikki million"
+→ "2 mln"
+
+"bir million ikki yuz ming"
+→ "1.2 mln"
+
+"ikki million besh yuz ming"
+→ "2.5 mln"
+
+"uch million yetti yuz ming"
+→ "3.7 mln"
+
+=========================================================
+2. PUL BIRLIKLARI
+=========================================================
+
+"ming" → ming
+
+"million" → mln
+
+"million so'm" → mln
+
+"ming so'm" → ming
+
+=========================================================
+3. MA'NOLI SO'ZLARNI SAQLA
+=========================================================
+
+qarz
+qarzdor
+qarzim
+qaytardi
+qaytardim
+berdim
+oldim
+tushdi
+keldi
+ketdi
+sarfladim
+ishlatdim
+
+=========================================================
+4. ISMLARNI O'ZGARTIRMA
+=========================================================
+
+Ads
+Aziz
+Jasur
+Sardor
+Akmal
+
+kabi nomlarni imkon qadar Whisper bergan
+ko'rinishida saqla.
+
+=========================================================
+5. MISOLLAR
+=========================================================
+
+Input:
+Ads yetti yuz ming qarzdor
+
+Output:
+Qarzdor Ads 700 ming
+
+
+Input:
+Ads to'rt yuz ming qaytardi
+
+Output:
+Ads 400 ming qaytardi
+
+
+Input:
+Klientdan besh million tushdi
+
+Output:
+Klientdan 5 mln tushdi
+
+
+Input:
+Materialga bir million ikki yuz ming ketdi
+
+Output:
+Materialga 1.2 mln ketdi
+
+
+Input:
+Azizdan ikki million qarz oldim
+
+Output:
+Azizdan 2 mln qarz oldim
+
+
+Input:
+Azizga ikki million qarz berdim
+
+Output:
+Azizga 2 mln qarz berdim
+
+
+Input:
+Reklamaga ikki yuz ming ishlatdim
+
+Output:
+Reklamaga 200 ming ishlatdim
+
+=========================================================
+6. BIR NECHTA OPERATSIYA
+=========================================================
+
+Agar bir nechta operatsiya bo'lsa,
+hammasini saqla.
+
+Masalan:
+
+"klientdan besh million tushdi
+materialga bir million ikki yuz ming ketdi
+ishchiga sakkiz yuz ming berdim"
+
+Output:
+
+"Klientdan 5 mln tushdi
+Materialga 1.2 mln ketdi
+Ishchiga 800 ming berdim"
+
+=========================================================
+7. FAQAT TOZALANGAN MATNNI QAYTAR
+=========================================================
+
+JSON yozma.
+
+Izoh yozma.
+
+Markdown yozma.
+
+Tushuntirish yozma.
+
+Faqat tayyorlangan matnni qaytar.
+"""
+
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": system
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+
+        r = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+
+        r.raise_for_status()
+
+        data = r.json()
+
+        normalized = (
+            data["choices"][0]["message"]["content"]
+            .strip()
+        )
+
+        normalized = re.sub(
+            r"^```.*?\n",
+            "",
+            normalized,
+            flags=re.DOTALL
+        )
+
+        normalized = re.sub(
+            r"\n```$",
+            "",
+            normalized
+        )
+
+        normalized = normalized.strip()
+
+        print(
+            "VOICE NORMALIZED:",
+            normalized
+        )
+
+        return (
+            normalized
+            if normalized
+            else text
+        )
+
+    except Exception as e:
+
+        print(
+            "VOICE NORMALIZE ERROR:",
+            repr(e)
+        )
+
+        return text
 
 
 # =========================================================
@@ -383,6 +680,7 @@ def transcribe_audio(audio_bytes, filename="voice.ogg"):
 # =========================================================
 
 def groq_parse(text):
+
     if not GROQ_API_KEY:
         return None
 
@@ -459,6 +757,9 @@ FORMAT:
 "Material uchun 1 mln to'ladim"
 → EXPENSE
 
+"Reklamaga 200 ming ishlatdim"
+→ EXPENSE
+
 
 =========================================================
 3. QARZDAN PUL OLISH
@@ -497,40 +798,41 @@ Bu pul balansdan AYRILADI.
 
 
 =========================================================
-5. MUHIM: MENGA QARZDOR ODAM
+5. MENGA QARZDOR ODAM
 =========================================================
 
-Quyidagi gaplarda PUL HARAKATI YO'Q.
+Bu gaplarda pul harakati yo'q.
 
-Shuning uchun transaction yaratma.
-
-Faqat debts yarat.
+Transaction yaratma.
 
 "Qarzdor Ads 700 ming"
 
-→ debts:
-{
- "action": "NEW",
- "person": "Ads",
- "amount": 700000,
- "debt_type": "OWES_ME"
-}
+→ debt:
+OWES_ME
+
 
 "Ads 700 000 qarz"
 
-→ Ads menga 700000 qarzdor.
+→ debt:
+OWES_ME
+
 
 "Ads menga 700 ming qarz"
 
-→ Ads menga 700000 qarzdor.
+→ debt:
+OWES_ME
+
 
 "Ads menga 700 ming berishi kerak"
 
-→ Ads menga 700000 qarzdor.
+→ debt:
+OWES_ME
+
 
 "Adsdan 700 ming olishim kerak"
 
-→ Ads menga 700000 qarzdor.
+→ debt:
+OWES_ME
 
 
 =========================================================
@@ -539,18 +841,14 @@ Faqat debts yarat.
 
 "Azizga 2 mln qarzim bor"
 
-Bu faqat qarzdorlik ma'lumoti.
+Bu faqat qarzdorlik.
 
 transaction yaratma.
 
 debt_type = I_OWE
 
-Lekin MyFinance AI foydalanuvchiga
-qarzdorlar ro'yxatida faqat
-MENGA QARZDORLARNI ko'rsatadi.
-
-Shuning uchun bu qarz
-"Qarzdorlar" ro'yxatida ko'rsatilmaydi.
+Bu qarz "Qarzdorlar" ro'yxatida
+KO'RSATILMAYDI.
 
 
 =========================================================
@@ -565,13 +863,13 @@ amount = 400000
 person = Ads
 debt_action = REPAY
 
-→ debts:
-action = REPAY
+→ debt:
+REPAY
 person = Ads
 amount = 400000
 debt_type = OWES_ME
 
-Bu pul balansga QO'SHILADI.
+Balansga pul QO'SHILADI.
 
 
 =========================================================
@@ -586,13 +884,13 @@ amount = 400000
 person = Aziz
 debt_action = REPAY
 
-→ debts:
-action = REPAY
+→ debt:
+REPAY
 person = Aziz
 amount = 400000
 debt_type = I_OWE
 
-Bu pul balansdan AYRILADI.
+Balansdan pul AYRILADI.
 
 
 =========================================================
@@ -601,19 +899,17 @@ Bu pul balansdan AYRILADI.
 
 "Qarzdor Ads 700 ming"
 
-Bu faqat qarzdorlik.
-
 Balansga +700000 QO'SHILMASIN.
 
-Faqat Qarzdorlar ro'yxatiga yozilsin.
+Faqat qarzdorlikka yozilsin.
 
 
 =========================================================
 10. BIR NECHTA OPERATSIYA
 =========================================================
 
-"Klientdan 5 mln tushdi,
-materialga 1.2 mln,
+"Klientdan 5 mln tushdi
+materialga 1.2 mln ketdi
 ishchiga 800 ming ketdi"
 
 3 ta transaction yarat.
@@ -625,18 +921,18 @@ ishchiga 800 ming ketdi"
 
 "Qarzdor Ads 700 ming"
 
-person = "Ads"
+person = Ads
 
 "Azizdan 2 mln qarz oldim"
 
-person = "Aziz"
+person = Aziz
 
 "Jasur 500 ming qarz"
 
-person = "Jasur"
+person = Jasur
 
-Hech qachon qarzdorlik aniq odam bilan
-aytilgan bo'lsa person = null qilma.
+Agar odam aniq aytilgan bo'lsa
+person = null qilma.
 
 
 =========================================================
@@ -644,10 +940,15 @@ aytilgan bo'lsa person = null qilma.
 =========================================================
 
 "5 mln" = 5000000
+
 "1.2 mln" = 1200000
+
 "800 ming" = 800000
+
 "700 000" = 700000
+
 "700 ming" = 700000
+
 "2 million" = 2000000
 
 
@@ -655,11 +956,9 @@ aytilgan bo'lsa person = null qilma.
 13. FAQAT QARZ HAQIDA GAP
 =========================================================
 
-Agar foydalanuvchi:
-
 "Qarzdor Ads 700 ming"
 
-desa:
+Natija:
 
 {
  "transactions": [],
@@ -681,6 +980,7 @@ desa:
 Faqat JSON qaytar.
 
 Markdown yozma.
+
 Izoh yozma.
 """
 
@@ -705,6 +1005,7 @@ Izoh yozma.
     }
 
     try:
+
         r = requests.post(
             url,
             headers=headers,
@@ -756,7 +1057,12 @@ Izoh yozma.
         }
 
     except Exception as e:
-        print("GROQ ERROR:", repr(e))
+
+        print(
+            "GROQ ERROR:",
+            repr(e)
+        )
+
         return None
 
 
@@ -769,12 +1075,20 @@ def parse_text(text):
     fast = fast_parse(text)
 
     if fast:
-        print("FAST:", fast)
+
+        print(
+            "FAST:",
+            fast
+        )
+
         return fast
 
     ai = groq_parse(text)
 
-    print("AI:", ai)
+    print(
+        "AI:",
+        ai
+    )
 
     return ai
 
@@ -791,6 +1105,7 @@ def add_debt(
     debt_type,
     conn=None
 ):
+
     if not person:
         return
 
@@ -802,19 +1117,19 @@ def add_debt(
     own_conn = False
 
     if conn is None:
+
         conn = db()
         own_conn = True
 
     cur = conn.cursor()
 
-    # Shu odamning shu turdagi qarzi bor bo'lsa,
-    # yangi qator ochmaymiz.
     cur.execute("""
         SELECT id, amount
         FROM debts
         WHERE user_id = %s
           AND period_id = %s
-          AND LOWER(TRIM(person)) = LOWER(TRIM(%s))
+          AND LOWER(TRIM(person))
+              = LOWER(TRIM(%s))
           AND debt_type = %s
         ORDER BY id DESC
         LIMIT 1
@@ -866,6 +1181,7 @@ def add_debt(
         ))
 
     if own_conn:
+
         conn.commit()
         cur.close()
         conn.close()
@@ -879,6 +1195,7 @@ def change_debt(
     debt_type,
     conn=None
 ):
+
     if not person:
         return
 
@@ -887,6 +1204,7 @@ def change_debt(
     own_conn = False
 
     if conn is None:
+
         conn = db()
         own_conn = True
 
@@ -897,7 +1215,8 @@ def change_debt(
         FROM debts
         WHERE user_id = %s
           AND period_id = %s
-          AND LOWER(TRIM(person)) = LOWER(TRIM(%s))
+          AND LOWER(TRIM(person))
+              = LOWER(TRIM(%s))
           AND debt_type = %s
           AND amount > 0
         ORDER BY id
@@ -937,6 +1256,7 @@ def change_debt(
             ))
 
     if own_conn:
+
         conn.commit()
         cur.close()
         conn.close()
@@ -947,7 +1267,10 @@ def change_debt(
 # =========================================================
 
 def save_data(user_id, parsed):
-    period_id = get_current_period(user_id)
+
+    period_id = get_current_period(
+        user_id
+    )
 
     transactions = parsed.get(
         "transactions",
@@ -968,7 +1291,7 @@ def save_data(user_id, parsed):
     try:
 
         # =================================================
-        # DEBT-ONLY RECORDS
+        # DEBT ONLY
         # =================================================
 
         for debt in debts:
@@ -984,7 +1307,8 @@ def save_data(user_id, parsed):
             ).strip()
 
             amount = float(
-                debt.get("amount") or 0
+                debt.get("amount")
+                or 0
             )
 
             debt_type = (
@@ -1049,7 +1373,8 @@ def save_data(user_id, parsed):
             kind = item.get("type")
 
             amount = float(
-                item.get("amount") or 0
+                item.get("amount")
+                or 0
             )
 
             if amount <= 0:
@@ -1063,7 +1388,9 @@ def save_data(user_id, parsed):
             ]:
                 continue
 
-            person = item.get("person")
+            person = item.get(
+                "person"
+            )
 
             category = (
                 item.get("category")
@@ -1076,7 +1403,10 @@ def save_data(user_id, parsed):
                 )
             )
 
-            note = item.get("note") or ""
+            note = (
+                item.get("note")
+                or ""
+            )
 
             debt_action = (
                 item.get("debt_action")
@@ -1094,7 +1424,8 @@ def save_data(user_id, parsed):
                     category,
                     note
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES
+                (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 user_id,
@@ -1191,7 +1522,10 @@ def save_data(user_id, parsed):
 # =========================================================
 
 def get_report(user_id):
-    period_id = get_current_period(user_id)
+
+    period_id = get_current_period(
+        user_id
+    )
 
     conn = db()
     cur = conn.cursor()
@@ -1232,6 +1566,7 @@ def get_report(user_id):
             ), 0) AS debt_out
 
         FROM transactions
+
         WHERE user_id = %s
           AND period_id = %s
     """, (
@@ -1244,10 +1579,21 @@ def get_report(user_id):
     cur.close()
     conn.close()
 
-    income = float(row["income"])
-    expense = float(row["expense"])
-    debt_in = float(row["debt_in"])
-    debt_out = float(row["debt_out"])
+    income = float(
+        row["income"]
+    )
+
+    expense = float(
+        row["expense"]
+    )
+
+    debt_in = float(
+        row["debt_in"]
+    )
+
+    debt_out = float(
+        row["debt_out"]
+    )
 
     balance = (
         income
@@ -1273,7 +1619,10 @@ def get_transactions(
     user_id,
     kind=None
 ):
-    period_id = get_current_period(user_id)
+
+    period_id = get_current_period(
+        user_id
+    )
 
     conn = db()
     cur = conn.cursor()
@@ -1317,11 +1666,14 @@ def get_transactions(
 
 
 # =========================================================
-# DEBTORS ONLY
+# DEBTORS
 # =========================================================
 
 def get_debtors(user_id):
-    period_id = get_current_period(user_id)
+
+    period_id = get_current_period(
+        user_id
+    )
 
     conn = db()
     cur = conn.cursor()
@@ -1330,16 +1682,22 @@ def get_debtors(user_id):
         SELECT
             person,
             SUM(amount) AS amount
+
         FROM debts
+
         WHERE user_id = %s
           AND period_id = %s
           AND debt_type = 'OWES_ME'
           AND amount > 0
           AND person IS NOT NULL
           AND TRIM(person) <> ''
-          AND LOWER(TRIM(person)) <> 'noma''lum'
+          AND LOWER(TRIM(person))
+              <> 'noma''lum'
+
         GROUP BY person
+
         HAVING SUM(amount) > 0
+
         ORDER BY SUM(amount) DESC
     """, (
         user_id,
@@ -1355,11 +1713,14 @@ def get_debtors(user_id):
 
 
 # =========================================================
-# DELETE LAST
+# DELETE LAST TRANSACTION
 # =========================================================
 
 def delete_last_transaction(user_id):
-    period_id = get_current_period(user_id)
+
+    period_id = get_current_period(
+        user_id
+    )
 
     conn = db()
     cur = conn.cursor()
@@ -1385,7 +1746,10 @@ def delete_last_transaction(user_id):
 
         return None
 
-    # Qarz olgan bo'lsa
+    # =====================================================
+    # QARZ OLISHNI O'CHIRISH
+    # =====================================================
+
     if row["kind"] == "DEBT_IN":
 
         cur.execute("""
@@ -1393,7 +1757,8 @@ def delete_last_transaction(user_id):
             FROM debts
             WHERE user_id = %s
               AND period_id = %s
-              AND person = %s
+              AND LOWER(TRIM(person))
+                  = LOWER(TRIM(%s))
               AND debt_type = 'I_OWE'
             ORDER BY id DESC
             LIMIT 1
@@ -1430,7 +1795,10 @@ def delete_last_transaction(user_id):
                     debt["id"]
                 ))
 
-    # Birovga qarz bergan bo'lsa
+    # =====================================================
+    # QARZ BERISHNI O'CHIRISH
+    # =====================================================
+
     elif row["kind"] == "DEBT_OUT":
 
         cur.execute("""
@@ -1438,7 +1806,8 @@ def delete_last_transaction(user_id):
             FROM debts
             WHERE user_id = %s
               AND period_id = %s
-              AND person = %s
+              AND LOWER(TRIM(person))
+                  = LOWER(TRIM(%s))
               AND debt_type = 'OWES_ME'
             ORDER BY id DESC
             LIMIT 1
@@ -1475,12 +1844,45 @@ def delete_last_transaction(user_id):
                     debt["id"]
                 ))
 
+    # =====================================================
+    # QARZ QAYTARISHNI O'CHIRISH
+    # =====================================================
+
+    elif row["debt_action"] == "REPAY":
+
+        if row["kind"] == "INCOME":
+
+            add_debt(
+                user_id,
+                period_id,
+                row["person"],
+                row["amount"],
+                "OWES_ME",
+                conn
+            )
+
+        elif row["kind"] == "EXPENSE":
+
+            add_debt(
+                user_id,
+                period_id,
+                row["person"],
+                row["amount"],
+                "I_OWE",
+                conn
+            )
+
+    # =====================================================
+    # TRANSACTIONNI O'CHIRISH
+    # =====================================================
+
     cur.execute(
         "DELETE FROM transactions WHERE id = %s",
         (row["id"],)
     )
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -1492,6 +1894,7 @@ def delete_last_transaction(user_id):
 # =========================================================
 
 def keyboard():
+
     return ReplyKeyboardMarkup(
         [
             [
@@ -1521,9 +1924,12 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     user_id = update.effective_user.id
 
-    get_current_period(user_id)
+    get_current_period(
+        user_id
+    )
 
     await update.message.reply_text(
         "👋 MyFinance AI ga xush kelibsiz!\n\n"
@@ -1546,6 +1952,7 @@ async def show_income(
     update,
     context
 ):
+
     rows = get_transactions(
         update.effective_user.id,
         "INCOME"
@@ -1592,6 +1999,7 @@ async def show_expenses(
     update,
     context
 ):
+
     rows = get_transactions(
         update.effective_user.id,
         "EXPENSE"
@@ -1638,20 +2046,26 @@ async def show_report(
     update,
     context
 ):
+
     r = get_report(
         update.effective_user.id
     )
 
     text = (
         "📊 HISOBOT\n\n"
+
         f"💰 Tushum: "
         f"{money(r['income'])}\n"
+
         f"💸 Xarajat: "
         f"{money(r['expense'])}\n\n"
+
         f"🤝 Qarzdan kirim: "
         f"{money(r['debt_in'])}\n"
+
         f"🤝 Qarzga chiqim: "
         f"{money(r['debt_out'])}\n\n"
+
         f"🟢 Qoldiq: "
         f"{money(r['balance'])}"
     )
@@ -1670,6 +2084,7 @@ async def show_debtors(
     update,
     context
 ):
+
     rows = get_debtors(
         update.effective_user.id
     )
@@ -1688,9 +2103,15 @@ async def show_debtors(
 
     total = 0
 
-    for i, row in enumerate(rows, 1):
+    for i, row in enumerate(
+        rows,
+        1
+    ):
 
-        amount = float(row["amount"])
+        amount = float(
+            row["amount"]
+        )
+
         total += amount
 
         text += (
@@ -1716,6 +2137,7 @@ async def delete_last(
     update,
     context
 ):
+
     row = delete_last_transaction(
         update.effective_user.id
     )
@@ -1745,6 +2167,7 @@ async def new_period(
     update,
     context
 ):
+
     context.user_data[
         "confirm_new_period"
     ] = True
@@ -1766,6 +2189,7 @@ async def process_money_text(
     text,
     user_id
 ):
+
     print(
         "USER",
         user_id,
@@ -1773,7 +2197,9 @@ async def process_money_text(
         text
     )
 
-    parsed = parse_text(text)
+    parsed = parse_text(
+        text
+    )
 
     if not parsed:
 
@@ -1793,13 +2219,18 @@ async def process_money_text(
         parsed
     )
 
-    saved = result_data["transactions"]
-    debt_changes = result_data["debts"]
+    saved = result_data[
+        "transactions"
+    ]
+
+    debt_changes = result_data[
+        "debts"
+    ]
 
     result = ""
 
     # =====================================================
-    # DEBT-ONLY
+    # DEBT ONLY
     # =====================================================
 
     for debt in debt_changes:
@@ -1884,7 +2315,9 @@ async def process_money_text(
 
         return
 
-    report = get_report(user_id)
+    report = get_report(
+        user_id
+    )
 
     result += (
         f"\n🟢 Qoldiq: "
@@ -1905,6 +2338,7 @@ async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     user_id = update.effective_user.id
 
     # =====================================================
@@ -1915,7 +2349,7 @@ async def handle_message(
 
         await update.message.reply_text(
             "🎤 Ovoz qabul qilindi...\n"
-            "⏳ Matnga aylantirib, tahlil qilinyapti..."
+            "⏳ Ovoz tushunilmoqda..."
         )
 
         try:
@@ -1930,12 +2364,16 @@ async def handle_message(
                 .download_as_bytearray()
             )
 
-            text = transcribe_audio(
+            # ---------------------------------------------
+            # 1. WHISPER
+            # ---------------------------------------------
+
+            raw_text = transcribe_audio(
                 bytes(audio_bytes),
                 "voice.ogg"
             )
 
-            if not text:
+            if not raw_text:
 
                 await update.message.reply_text(
                     "❌ Ovozni tushunib bo'lmadi.",
@@ -1945,15 +2383,36 @@ async def handle_message(
                 return
 
             print(
-                "USER VOICE",
+                "USER VOICE RAW:",
                 user_id,
                 ":",
-                text
+                raw_text
             )
+
+            # ---------------------------------------------
+            # 2. VOICE TEXT NORMALIZATION
+            # ---------------------------------------------
+
+            normalized_text = (
+                normalize_voice_text(
+                    raw_text
+                )
+            )
+
+            print(
+                "USER VOICE NORMALIZED:",
+                user_id,
+                ":",
+                normalized_text
+            )
+
+            # ---------------------------------------------
+            # 3. FINANCE PARSER
+            # ---------------------------------------------
 
             await process_money_text(
                 update,
-                text,
+                normalized_text,
                 user_id
             )
 
@@ -1995,7 +2454,9 @@ async def handle_message(
             "да"
         ]:
 
-            create_new_period(user_id)
+            create_new_period(
+                user_id
+            )
 
             context.user_data[
                 "confirm_new_period"
@@ -2101,6 +2562,7 @@ async def error_handler(
     update,
     context
 ):
+
     print(
         "BOT ERROR:",
         repr(context.error)
