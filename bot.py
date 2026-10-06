@@ -2034,31 +2034,32 @@ def main():
         error_handler
     )
 
-    # Render Webhook
+    # =====================================================
+    # RENDER WEBHOOK
+    # =====================================================
+
     if RENDER_EXTERNAL_URL:
 
-        webhook_url = (
-            RENDER_EXTERNAL_URL.rstrip("/")
-            + f"/{BOT_TOKEN}"
-        )
+        base_url = RENDER_EXTERNAL_URL.rstrip("/")
+        webhook_url = f"{base_url}/{BOT_TOKEN}"
 
-        print(
-            "WEBHOOK:",
-            webhook_url
-        )
+        print("WEBHOOK URL:", webhook_url)
 
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
+            url_path=BOT_TOKEN,          # MUHIM
             webhook_url=webhook_url,
-            secret_token=None,
+            drop_pending_updates=True,
         )
+
+    # =====================================================
+    # LOCAL POLLING
+    # =====================================================
 
     else:
 
-        print(
-            "BOT POLLING MODE"
-        )
+        print("BOT POLLING MODE")
 
         application.run_polling(
             drop_pending_updates=True
